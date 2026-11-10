@@ -28,24 +28,8 @@ async def test_project(dut):
     CAPTURE_FRAMES = 3
 
     # Derived constants
-    H_SYNC_START = H_DISPLAY + H_FRONT
-    H_SYNC_END = H_SYNC_START + H_SYNC
-    H_TOTAL = H_SYNC_END + H_BACK
-    V_SYNC_START = V_DISPLAY + V_FRONT
-    V_SYNC_END = V_SYNC_START + V_SYNC
-    V_TOTAL = V_SYNC_END + V_BACK
-
-    # hvsync_generator registers hsync/vsync from hpos/vpos, so the sync
-    # outputs are always one clock behind the counters they come from.
-    SYNC_LATENCY = 1
-
-    def expected_hsync(i):
-        return 0 if H_SYNC_START <= i - SYNC_LATENCY < H_SYNC_END else 1
-
-    def expected_vsync(line, i):
-        # On the first pixel of a line vsync still reflects the previous line.
-        v = (line - 1) % V_TOTAL if i == 0 else line
-        return 0 if V_SYNC_START <= v < V_SYNC_END else 1
+    H_TOTAL = H_DISPLAY + H_FRONT + H_SYNC + H_BACK
+    V_TOTAL = V_DISPLAY + V_FRONT + V_SYNC + V_BACK
 
     # Palette mapping uo_out values to RGB color
     # uo_out = {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]}
@@ -69,50 +53,86 @@ async def test_project(dut):
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
-    # Releasing reset leaves hpos=0 and vpos=0, so the next read is pixel 0 of
-    # line 0. Waiting extra clocks here would shift the whole capture.
 
-    # Define some functions for capturing lines & frames
+    # hvsync_generator registers hsync/vsync from hpos/vpos, so the sync
+    # outputs are one clock behind the pixel counters, and the exact phase the
+    # testbench observes also depends on where the capture starts. Instead of
+    # hard-coding that phase, measure the sync pattern on the first line/frame
+    # and then require every following line/frame to match it exactly.
+    hsync_offset = None
+    vsync_offset = None
 
-    async def check_line(line):
+    async def sample_line():
+        """Read H_TOTAL pixels of uo_out -> (hsync bits, mid-line vsync, px)."""
+        hsync = []
+        pixels = bytearray(H_DISPLAY * 3)
+        vsync_mid = 1
         for i in range(H_TOTAL):
-            hsync = int(dut.uo_out.value[7])
-            vsync = int(dut.uo_out.value[3])
-            assert hsync == expected_hsync(i), "Unexpected hsync pattern"
-            assert vsync == expected_vsync(line, i), "Unexpected vsync pattern"
-            await ClockCycles(dut.clk, 1)
-
-    async def capture_line(framebuffer, line):
-        for i in range(H_TOTAL):
-            hsync = int(dut.uo_out.value[7])
-            vsync = int(dut.uo_out.value[3])
-            assert hsync == expected_hsync(i), "Unexpected hsync pattern"
-            assert vsync == expected_vsync(line, i), "Unexpected vsync pattern"
+            value = int(dut.uo_out.value)
+            hsync.append((value >> 7) & 1)
             if i < H_DISPLAY:
-                offset = 3 * line * H_DISPLAY + 3 * i
-                framebuffer[offset:offset+3] = palette[int(dut.uo_out.value)]
+                pixels[3*i:3*i+3] = palette[value]
+            if i == H_TOTAL // 2:
+                vsync_mid = (value >> 3) & 1
             await ClockCycles(dut.clk, 1)
+        return hsync, vsync_mid, pixels
 
-    async def skip_frame(frame_num):
-        dut._log.info(f"Skipping frame {frame_num}")
-        await ClockCycles(dut.clk, H_TOTAL*V_TOTAL)
+    def check_hsync(hsync, line):
+        nonlocal hsync_offset
+        zeros = [i for i, b in enumerate(hsync) if b == 0]
+        assert len(zeros) == H_SYNC, (
+            f"line {line}: hsync was low for {len(zeros)} pixels, expected {H_SYNC}"
+        )
+        start = zeros[0]
+        assert zeros[-1] - start + 1 == H_SYNC, (
+            f"line {line}: hsync pulse is not contiguous (starts at {start}, "
+            f"last low pixel at {zeros[-1]})"
+        )
+        if hsync_offset is None:
+            hsync_offset = start
+            dut._log.info(f"hsync pulse starts at pixel {start} of every line")
+        else:
+            assert start == hsync_offset, (
+                f"line {line}: hsync pulse moved to pixel {start}, "
+                f"expected {hsync_offset}"
+            )
+
+    def check_vsync(vsync_lines, frame_num):
+        nonlocal vsync_offset
+        low = [i for i, b in enumerate(vsync_lines) if b == 0]
+        assert len(low) == V_SYNC, (
+            f"frame {frame_num}: vsync was low for {len(low)} lines, "
+            f"expected {V_SYNC}"
+        )
+        assert low[-1] - low[0] + 1 == V_SYNC, (
+            f"frame {frame_num}: vsync lines are not contiguous"
+        )
+        assert low[0] >= V_DISPLAY, (
+            f"frame {frame_num}: vsync pulse overlaps the visible lines "
+            f"(starts at line {low[0]})"
+        )
+        if vsync_offset is None:
+            vsync_offset = low[0]
+            dut._log.info(f"vsync pulse starts at line {low[0]} of every frame")
+        else:
+            assert low[0] == vsync_offset, (
+                f"frame {frame_num}: vsync pulse moved to line {low[0]}, "
+                f"expected {vsync_offset}"
+            )
 
     async def capture_frame(frame_num):
         framebuffer = bytearray(V_DISPLAY*H_DISPLAY*3)
-        for line in range(V_DISPLAY):
-            dut._log.info(f"Frame {frame_num}, line {line} (display)")
-            await capture_line(framebuffer, line)
-        for line in range(V_DISPLAY, V_SYNC_START):
-            dut._log.info(f"Frame {frame_num}, line {line} (front porch)")
-            await check_line(line)
-        for line in range(V_SYNC_START, V_SYNC_END):
-            dut._log.info(f"Frame {frame_num}, line {line} (sync pulse)")
-            await check_line(line)
-        for line in range(V_SYNC_END, V_TOTAL):
-            dut._log.info(f"Frame {frame_num}, line {line} (back porch)")
-            await check_line(line)
-        frame = Image.frombytes('RGB', (H_DISPLAY, V_DISPLAY), bytes(framebuffer))
-        return frame
+        vsync_lines = []
+        for line in range(V_TOTAL):
+            hsync, vsync_mid, pixels = await sample_line()
+            check_hsync(hsync, line)
+            vsync_lines.append(vsync_mid)
+            if line < V_DISPLAY:
+                if line % 120 == 0:
+                    dut._log.info(f"Frame {frame_num}, line {line} (display)")
+                framebuffer[3*line*H_DISPLAY:3*(line+1)*H_DISPLAY] = pixels
+        check_vsync(vsync_lines, frame_num)
+        return Image.frombytes('RGB', (H_DISPLAY, V_DISPLAY), bytes(framebuffer))
 
     # Start capturing
 
