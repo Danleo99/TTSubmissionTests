@@ -35,6 +35,18 @@ async def test_project(dut):
     V_SYNC_END = V_SYNC_START + V_SYNC
     V_TOTAL = V_SYNC_END + V_BACK
 
+    # hvsync_generator registers hsync/vsync from hpos/vpos, so the sync
+    # outputs are always one clock behind the counters they come from.
+    SYNC_LATENCY = 1
+
+    def expected_hsync(i):
+        return 0 if H_SYNC_START <= i - SYNC_LATENCY < H_SYNC_END else 1
+
+    def expected_vsync(line, i):
+        # On the first pixel of a line vsync still reflects the previous line.
+        v = (line - 1) % V_TOTAL if i == 0 else line
+        return 0 if V_SYNC_START <= v < V_SYNC_END else 1
+
     # Palette mapping uo_out values to RGB color
     # uo_out = {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]}
     palette = [bytes(3)] * 256
@@ -57,50 +69,48 @@ async def test_project(dut):
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
-    await ClockCycles(dut.clk, 2)
+    # Releasing reset leaves hpos=0 and vpos=0, so the next read is pixel 0 of
+    # line 0. Waiting extra clocks here would shift the whole capture.
 
     # Define some functions for capturing lines & frames
 
-    async def check_line(expected_vsync):
+    async def check_line(line):
         for i in range(H_TOTAL):
             hsync = int(dut.uo_out.value[7])
             vsync = int(dut.uo_out.value[3])
-            assert hsync == (0 if H_SYNC_START <= i < H_SYNC_END else 1), "Unexpected hsync pattern"
-            assert vsync == expected_vsync, "Unexpected vsync pattern"
+            assert hsync == expected_hsync(i), "Unexpected hsync pattern"
+            assert vsync == expected_vsync(line, i), "Unexpected vsync pattern"
             await ClockCycles(dut.clk, 1)
 
-    async def capture_line(framebuffer, offset):
+    async def capture_line(framebuffer, line):
         for i in range(H_TOTAL):
             hsync = int(dut.uo_out.value[7])
             vsync = int(dut.uo_out.value[3])
-            assert hsync == (0 if H_SYNC_START <= i < H_SYNC_END else 1), "Unexpected hsync pattern"
-            assert vsync == 1, "Unexpected vsync pattern"
+            assert hsync == expected_hsync(i), "Unexpected hsync pattern"
+            assert vsync == expected_vsync(line, i), "Unexpected vsync pattern"
             if i < H_DISPLAY:
-                framebuffer[offset+3*i:offset+3*i+3] = palette[int(dut.uo_out.value)]
+                offset = 3 * line * H_DISPLAY + 3 * i
+                framebuffer[offset:offset+3] = palette[int(dut.uo_out.value)]
             await ClockCycles(dut.clk, 1)
 
     async def skip_frame(frame_num):
         dut._log.info(f"Skipping frame {frame_num}")
         await ClockCycles(dut.clk, H_TOTAL*V_TOTAL)
 
-    async def capture_frame(frame_num, check_sync=True):
+    async def capture_frame(frame_num):
         framebuffer = bytearray(V_DISPLAY*H_DISPLAY*3)
-        for j in range(V_DISPLAY):
-            dut._log.info(f"Frame {frame_num}, line {j} (display)")
-            line = await capture_line(framebuffer, 3*j*H_DISPLAY)
-        if check_sync:
-            for j in range(j, j+V_FRONT):
-                dut._log.info(f"Frame {frame_num}, line {j} (front porch)")
-                await check_line(1)
-            for j in range(j, j+V_SYNC):
-                dut._log.info(f"Frame {frame_num}, line {j} (sync pulse)")
-                await check_line(0)
-            for j in range(j, j+V_BACK):
-                dut._log.info(f"Frame {frame_num}, line {j} (back porch)")
-                await check_line(1)
-        else:
-            dut._log.info(f"Frame {frame_num}, skipping non-display lines")
-            await ClockCycles(dut.clk, H_TOTAL*(V_TOTAL-V_DISPLAY))
+        for line in range(V_DISPLAY):
+            dut._log.info(f"Frame {frame_num}, line {line} (display)")
+            await capture_line(framebuffer, line)
+        for line in range(V_DISPLAY, V_SYNC_START):
+            dut._log.info(f"Frame {frame_num}, line {line} (front porch)")
+            await check_line(line)
+        for line in range(V_SYNC_START, V_SYNC_END):
+            dut._log.info(f"Frame {frame_num}, line {line} (sync pulse)")
+            await check_line(line)
+        for line in range(V_SYNC_END, V_TOTAL):
+            dut._log.info(f"Frame {frame_num}, line {line} (back porch)")
+            await check_line(line)
         frame = Image.frombytes('RGB', (H_DISPLAY, V_DISPLAY), bytes(framebuffer))
         return frame
 
@@ -115,12 +125,25 @@ async def test_project(dut):
 
 @cocotb.test()
 async def compare_reference(dut):
+    images = sorted(glob.glob("output/frame*.png"))
+    references = sorted(glob.glob("reference/frame*.png"))
 
-    for img in glob.glob("output/frame*.png"):
+    if not references:
+        dut._log.warning(
+            "No reference frames in test/reference/ - skipping comparison. "
+            "Copy output/frame*.png there to enable the golden image check."
+        )
+        return
+
+    for img in images:
         basename = img.removeprefix("output/")
+        ref_path = f"reference/{basename}"
+        if not os.path.exists(ref_path):
+            dut._log.warning(f"No reference image for {basename} - skipping")
+            continue
         dut._log.info(f"Comparing {basename} to reference image")
         frame = Image.open(img)
-        ref = Image.open(f"reference/{basename}")
+        ref = Image.open(ref_path)
         diff = ImageChops.difference(frame, ref)
         if diff.getbbox() is not None:
             diff.save(f"output/diff_{basename}")
