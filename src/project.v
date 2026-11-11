@@ -505,10 +505,12 @@ module tt_um_vga_example (
         falling_pixel = 1'b0;
 
         if (in_board && (tile_y < 5'd20)) begin
+            // tile_x stays 5 bits for the signed piece_dx math, but bitplane
+            // rows are only 10 bits wide: index them with tile_x[3:0].
             board_color = {
-                board_2[tile_y][tile_x],
-                board_1[tile_y][tile_x],
-                board_0[tile_y][tile_x]
+                board_2[tile_y][tile_x[3:0]],
+                board_1[tile_y][tile_x[3:0]],
+                board_0[tile_y][tile_x[3:0]]
             };
 
             if ((state != TITLE) && (state != OVER) &&
